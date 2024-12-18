@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
-
-pragma solidity ^0.8.27;
+pragma solidity 0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -29,6 +28,8 @@ contract Blacksail_Vault is ERC20, ReentrancyGuard, Ownable {
 
     event ProposedStrategyUpgrade(address implementation);
     event UpgradeStrat(address implementation);
+    event Deposit(address indexed user, uint256 amount);
+    event Withdraw(address indexed user, uint256 amount);
 
     /**
     * @dev Initializes the vault contract.
@@ -66,7 +67,6 @@ contract Blacksail_Vault is ERC20, ReentrancyGuard, Ownable {
         return want().balanceOf(address(this));
     }
 
-    
     /** @dev Provides the value of one vault share in terms of the underlying asset, with 18 decimals, for UI display. */
     function getPricePerFullShare() public view returns (uint256) {
         return totalSupply() == 0 ? 1e18 : balance() * 1e18 / totalSupply();
@@ -102,6 +102,8 @@ contract Blacksail_Vault is ERC20, ReentrancyGuard, Ownable {
             shares = (_amount * totalSupply()) / _pool;
         }
 
+        emit Deposit(msg.sender, _amount);
+        accountData[msg.sender].lastAction = "Deposit";
         updateDeposit(msg.sender, shares);
         _mint(msg.sender, shares);
     }
@@ -115,20 +117,18 @@ contract Blacksail_Vault is ERC20, ReentrancyGuard, Ownable {
         strategy.deposit();
     }
 
-    
     /** @dev Helper to withdraw all funds for the sender. */
     function withdrawAll() external {
         withdraw(balanceOf(msg.sender));
     }
 
-    
     /**
     * @dev Allows a user to withdraw their share of funds from the vault.
     * Burns the user's vault tokens, calculates the proportional amount of underlying tokens, and transfers them back to the user.
     * If there are insufficient funds in the vault, it withdraws the required amount from the strategy.
     * Updates the user's deposit record and ensures safe transfer of tokens.
     * @param _shares The number of vault tokens to redeem for underlying assets. */
-    function withdraw(uint256 _shares) public {
+    function withdraw(uint256 _shares) public nonReentrant {
         uint256 r = (balance() * _shares) / totalSupply();
         _burn(msg.sender, _shares);
 
@@ -143,6 +143,9 @@ contract Blacksail_Vault is ERC20, ReentrancyGuard, Ownable {
             }
         }
 
+        
+        emit Withdraw(msg.sender, r);
+        accountData[msg.sender].lastAction = "Withdraw";
         updateDeposit(msg.sender, _shares);
         want().safeTransfer(msg.sender, r);
     }
@@ -245,5 +248,10 @@ contract Blacksail_Vault is ERC20, ReentrancyGuard, Ownable {
         stratCandidate.proposedTime = 5000000000;
 
         earn();
+    }
+
+    function getAccountInfo(address _account) public view returns (uint256, uint256, string memory, bool) {
+        AccountInfo storage info = accountData[_account];
+        return (info.actionTime, info.amount, info.lastAction, info.staked);
     }
 }

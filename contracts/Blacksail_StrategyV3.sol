@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
-
-pragma solidity ^0.8.27;
+pragma solidity 0.8.20;
 
 import '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import '@openzeppelin/contracts/access/Ownable.sol';
 import '@openzeppelin/contracts/utils/Pausable.sol';
 import './BlackSail_Interface.sol';
@@ -34,10 +34,10 @@ interface IUniswapRouterV3 {
     /// @param params The parameters necessary for the multi-hop swap, encoded as `ExactInputParams` in calldata
     /// @return amountOut The amount of the received token
     function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
+    function quoteExactInput(bytes memory path, uint256 amountIn) external returns (uint256 amountOut);
 }
 
-
-contract Blacksail_StrategyV3 is Ownable, Pausable {
+contract Blacksail_StrategyV3 is Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     uint256 public immutable MAX = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff;
@@ -74,12 +74,15 @@ contract Blacksail_StrategyV3 is Ownable, Pausable {
     // Routes
     ISolidlyRouter.Routes[] public rewardToNative;
     address[] public rewards;
+    uint256 public slippageTolerance;
 
     event Deposit(uint256 amount);
     event Withdraw(uint256 amount);
     event Harvest(address indexed harvester);
     event ChargeFees(uint256 callFee, uint256 protocolFee);
     event SetVault(address indexed newVault);
+    event SetWithdrawalFee(uint256 newFee);
+    event SetSlippageTolerance(uint256 newTolerance);
 
     IUniswapRouterV3.ExactInputParams params;
 
@@ -110,6 +113,7 @@ contract Blacksail_StrategyV3 is Ownable, Pausable {
         address _unirouter,
         address _v3router,
         bool _harvestOnDeposit,
+        address _treasury,
         ISolidlyRouter.Routes[] memory _rewardToNative
     ) Ownable(msg.sender) {
 
@@ -119,6 +123,7 @@ contract Blacksail_StrategyV3 is Ownable, Pausable {
         vaultDeployer = _vaultDeployer;
         unirouter = _unirouter;
         v3router = _v3router;
+        treasury = _treasury;
 
         harvestOnDeposit = _harvestOnDeposit;
         if (harvestOnDeposit) {
@@ -139,6 +144,7 @@ contract Blacksail_StrategyV3 is Ownable, Pausable {
 
     /** @dev Sets the vault connected to this strategy */
     function setVault(address _vault) external onlyOwner {
+        require(isContract(_vault), "Vault must be a contract");
         vault = _vault;
         emit SetVault(_vault);
     }
@@ -147,12 +153,12 @@ contract Blacksail_StrategyV3 is Ownable, Pausable {
     function beforeDeposit() external virtual {
         if (harvestOnDeposit) {
             require(msg.sender == vault, "Vault deposit only");
-            _harvest(tx.origin);
+            _harvest(address(this));
         }
     }
 
     /** @dev Deposits funds into third party farm */
-    function deposit() public whenNotPaused {
+    function deposit() public onlyAuthorized whenNotPaused {
 
         uint256 staking_balance = IERC20(staking_token).balanceOf(address(this));
 
@@ -173,7 +179,7 @@ contract Blacksail_StrategyV3 is Ownable, Pausable {
     *
     * Emits a {Withdraw} event with the updated strategy balance. */
 
-    function withdraw(uint256 _amount) external {
+    function withdraw(uint256 _amount) external nonReentrant {
         require(msg.sender == vault, "!vault");
 
         uint256 stakingBal = IERC20(staking_token).balanceOf(address(this));
@@ -189,10 +195,8 @@ contract Blacksail_StrategyV3 is Ownable, Pausable {
 
         uint256 wFee = (stakingBal * WITHDRAW_FEE) / WITHDRAWAL_MAX;
 
-        if (tx.origin != owner() && !paused()) {
-            if (!harvestOnDeposit) {
-                stakingBal = stakingBal - wFee;
-            }
+        if (!paused() && !harvestOnDeposit) {
+            stakingBal = stakingBal - wFee;
         }
 
         IERC20(staking_token).safeTransfer(vault, stakingBal);
@@ -202,14 +206,10 @@ contract Blacksail_StrategyV3 is Ownable, Pausable {
 
     /**
     * @dev Triggers the harvest process to compound earnings.
-    * 
-    * Requirements:
-    * - Can only be called by the original external caller (`tx.origin`) or the vault.
-    *
     * Internally calls `_harvest` to collect rewards, charge fees, add liquidity, and reinvest. */
 
     function harvest() external {
-        require(msg.sender == tx.origin || msg.sender == vault, "!auth Contract Harvest");
+        require(!isContract(msg.sender) || msg.sender == vault, "!auth Contract Harvest");
         _harvest(msg.sender);
     }
 
@@ -232,18 +232,27 @@ contract Blacksail_StrategyV3 is Ownable, Pausable {
     /** @dev This function converts all funds to WFTM, charges fees, and sends fees to respective accounts */
     function chargeFees(address caller) internal {                  
         uint256 toNative = IERC20(reward_token).balanceOf(address(this));
+        require(toNative > 0, "Insufficient reward token balance");
+
+        uint256 allowance = IERC20(reward_token).allowance(address(this), unirouter);
+        require(allowance >= toNative, "Insufficient reward token allowance");
 
         ISolidlyRouter(unirouter).swapExactTokensForTokens(toNative, 0, rewardToNative, address(this), block.timestamp);
         
-        uint256 nativeBal = IERC20(native_token).balanceOf(address(this)) * PLATFORM_FEE / DIVISOR;         
+        uint256 nativeBal = IERC20(native_token).balanceOf(address(this));
+        require(nativeBal > 0, "Insufficient native token balance");
 
-        uint256 callFeeAmount = nativeBal * CALL_FEE / DIVISOR;      
-        IERC20(native_token).safeTransfer(caller, callFeeAmount);
+        uint256 platformFee = (nativeBal * PLATFORM_FEE) / DIVISOR;
+        uint256 callFeeAmount = (platformFee * CALL_FEE) / DIVISOR;
+        uint256 treasuryFee = platformFee - callFeeAmount;
 
-        uint256 sailFee = nativeBal - callFeeAmount;
-        IERC20(native_token).safeTransfer(treasury, sailFee);
+        if (caller != address(this)) {
+            IERC20(native_token).safeTransfer(caller, callFeeAmount);
+        }
+        
+        IERC20(native_token).safeTransfer(treasury, treasuryFee);
 
-        emit ChargeFees(callFeeAmount, sailFee);
+        emit ChargeFees(callFeeAmount, platformFee);
     }
 
     /**
@@ -258,27 +267,50 @@ contract Blacksail_StrategyV3 is Ownable, Pausable {
     * - The contract must have a positive balance of the native token. */
 
     function addLiquidity() internal {
-
         uint256 nativeBalance = IERC20(native_token).balanceOf(address(this));
         require(nativeBalance > 0, "No native token balance");
+        
+        params.path = abi.encodePacked(native_token, uint24(3000), deposit_token);
+
+        uint256 estimatedAmountOut = IUniswapRouterV3(v3router).quoteExactInput(params.path, nativeBalance);
+
+        require(estimatedAmountOut > 0, "Invalid quote from router");
+
+        uint256 minimumAmountOut = (estimatedAmountOut * (10000 - slippageTolerance)) / 10000;
 
         params.amountIn = nativeBalance;
-        params.path = abi.encodePacked(native_token, uint24(3000), deposit_token);
         params.recipient = address(this);
-        params.amountOutMinimum = 0;
+        params.amountOutMinimum = minimumAmountOut;
 
         IERC20(native_token).approve(v3router, nativeBalance);
 
         if (native_token != deposit_token) {
-            IUniswapRouterV3(v3router).exactInput(params);
+            try IUniswapRouterV3(v3router).exactInput(params) returns (uint256 amountOut) {
+                // Success
+            } catch Error(string memory reason) {
+                revert(string(abi.encodePacked("Swap failed: ", reason)));
+            } catch (bytes memory lowLevelData) {
+                revert(string(abi.encodePacked("Swap failed with low-level data: ", lowLevelData)));
+            }
         }
 
         uint256 depositTokenBal = IERC20(deposit_token).balanceOf(address(this));
 
         if (depositTokenBal > 0) {
-            IIchiDepositHelper(ichi).forwardDepositToICHIVault(
-                staking_token, vaultDeployer, deposit_token, depositTokenBal, 0, address(this)
-            );
+            try IIchiDepositHelper(ichi).forwardDepositToICHIVault(
+            staking_token,
+            vaultDeployer,
+            deposit_token,
+            depositTokenBal,
+            0,
+            address(this)
+            ) {
+               
+            } catch Error(string memory reason) {
+                revert(string(abi.encodePacked("Deposit to ICHI Vault failed: ", reason)));
+            } catch (bytes memory lowLevelData) {
+                revert(string(abi.encodePacked("Deposit to ICHI Vault failed with low-level data: ", lowLevelData)));
+            }
         }
     }
 
@@ -383,5 +415,36 @@ contract Blacksail_StrategyV3 is Ownable, Pausable {
         require(fee <= 100, "Fee too high");
 
         WITHDRAW_FEE = fee;
+        emit SetWithdrawalFee(fee);
+    }
+
+    /**
+    * @dev Allows the contract owner to set the slippage tolerance for token swaps.
+    * This value is used to calculate the minimum acceptable output amount in swaps,
+    * helping to mitigate the risks of slippage and unfavorable price changes.
+    * 
+    * Requirements:
+    * - The caller must be the contract owner.
+    * - The provided tolerance must be less than or equal to 1500 (representing a maximum of 15% slippage).
+    * 
+    * Emits:
+    * - A {SetSlippageTolerance} event indicating the updated slippage tolerance.
+    * 
+    * @param _tolerance The new slippage tolerance value, scaled by 10,000 (e.g., 1500 = 15%).
+    */
+    function setSlippageTolerance(uint256 _tolerance) external onlyOwner {
+        require(_tolerance <= 1500, "Invalid tolerance"); // Max 15%
+
+        slippageTolerance = _tolerance;
+        emit SetSlippageTolerance(slippageTolerance);
+    }
+
+    function isContract(address account) internal view returns (bool) {
+        return account.code.length > 0;
+    }
+
+    modifier onlyAuthorized() {
+        require(msg.sender == vault || msg.sender == address(this), "Not authorized, only Vault or Strategy");
+        _;
     }
 }
