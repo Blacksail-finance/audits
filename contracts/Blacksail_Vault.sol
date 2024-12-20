@@ -17,7 +17,7 @@ contract Blacksail_Vault is ERC20, ReentrancyGuard, Ownable {
     // The strategy currently in use by the vault.
     ISailStrategy public strategy;
     // The minimum time it has to pass before a strat candidate can be approved, set to 24 hours
-    uint256 constant approvalDelay = 86400;
+    uint256 constant public approvalDelay = 86400;
 
     struct AccountInfo {
         uint256 actionTime;
@@ -143,7 +143,6 @@ contract Blacksail_Vault is ERC20, ReentrancyGuard, Ownable {
             }
         }
 
-        
         emit Withdraw(msg.sender, r);
         accountData[msg.sender].lastAction = "Withdraw";
         updateDeposit(msg.sender, _shares);

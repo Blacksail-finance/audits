@@ -365,12 +365,6 @@ contract Blacksail_StrategyV3 is Ownable, Pausable, ReentrancyGuard {
         IERC20(staking_token).transfer(vault, stakingBal);
     }
 
-    /** @dev Pauses the strategy contract and executes the emergency withdraw function */
-    function panic() public onlyOwner {
-        pause();
-        IEqualizerPool(rewardPool).withdraw(balanceOfPool());
-    }
-
     /** @dev Pauses the strategy contract */
     function pause() public onlyOwner {
         _pause();
