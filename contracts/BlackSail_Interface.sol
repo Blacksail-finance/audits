@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
-
-pragma solidity ^0.8.27;
+pragma solidity 0.8.20;
 
 import '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 
@@ -31,7 +30,6 @@ interface ISailStrategy {
     function lastHarvest() external view returns (uint256);
     function harvest() external;
     function retireStrat() external;
-    function panic() external;
     function pause() external;
     function unpause() external;
     function paused() external view returns (bool);
